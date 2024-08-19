@@ -10,15 +10,29 @@
 ////////////////////////////////////////////////////////////////////////////////
 //
 // Data Imports & Global variables
-//
+//user req start date
 
-var woreda = ee.FeatureCollection("users/mcwimberly/amhara_woredas_geo"),
-    gpm = ee.ImageCollection("NASA/GPM_L3/IMERG_V06"),
-    lstTerra8 = ee.ImageCollection("MODIS/006/MOD11A2")
+// var woreda = ee.FeatureCollection("users/mcwimberly/amhara_woredas_geo"),
+var gpm = ee.ImageCollection("NASA/GPM_L3/IMERG_V07"),
+    lstTerra8 = ee.ImageCollection("MODIS/061/MOD11A2")
                 //after MCST outage
                 .filterDate('2001-06-26', Date.now()),
-    brdfReflect = ee.ImageCollection("MODIS/006/MCD43A4"),
-    brdfQA = ee.ImageCollection("MODIS/006/MCD43A2");
+    brdfReflect = ee.ImageCollection('MODIS/061/MCD43A4'),
+    brdfQA = ee.ImageCollection("MODIS/061/MCD43A2");
+
+
+var woreda = ee.FeatureCollection(table).map(function(feature) {
+  return feature.set({
+    'Shape_Leng': feature.get('Shape_Leng'),
+    'wid': feature.get('ADM3_PCODE'),
+    'pilot': ee.String('N/A'), // Set a default value or derive from existing fields if possible
+    'zone': feature.get('ADM2_EN'),
+    'Shape_Area': feature.get('Shape_Area'),
+    'woreda': feature.get('ADM3_EN'),
+    'system:index': feature.get('system:index')
+  });
+});
+
 
 // Will be set with parsed user input
 // User requested start and end dates
@@ -155,7 +169,7 @@ function calculateEnvVars(userStartDate, userEndDate){
   // Filter gpm by date, using modified start if necessary
   var gpmFiltered = gpm
     .filterDate(precipStartDate, reqEndDate.advance(1, 'day'))
-    .select('precipitationCal');
+    .select('precipitation');
   
   // Calculate date of most recent measurement for gpm (in modified requested window)
   var gpmMax = gpmFiltered.reduceColumns(ee.Reducer.max(), ["system:time_start"]);
@@ -176,20 +190,47 @@ function calculateEnvVars(userStartDate, userEndDate){
   // Step 2b: Calculate daily precipitation
   
   // Function to calculate daily precipitation
+  // function calcDailyPrecip(curdate) {
+  //     var curyear = ee.Date(curdate).get('year');
+  //     var curdoy = ee.Date(curdate).getRelative('day', 'year').add(1);
+  //     var totprec = gpmFiltered.select('precipitation')
+  //                 .filterDate(ee.Date(curdate), ee.Date(curdate).advance(1, 'day'))
+  //                 .sum()
+  //                 //every half-hour
+  //                 .multiply(0.5)
+  //                 .rename('totprec');
+  //     return totprec
+  //         .set('doy', curdoy)
+  //         .set('year', curyear)
+  //         .set('system:time_start', curdate);
+  // }
+  
+  
   function calcDailyPrecip(curdate) {
-      var curyear = ee.Date(curdate).get('year');
-      var curdoy = ee.Date(curdate).getRelative('day', 'year').add(1);
-      var totprec = gpmFiltered.select('precipitationCal')
+    var curyear = ee.Date(curdate).get('year');
+    var curdoy = ee.Date(curdate).getRelative('day', 'year').add(1);
+    
+    var totprec = gpmFiltered.select('precipitation')
                   .filterDate(ee.Date(curdate), ee.Date(curdate).advance(1, 'day'))
-                  .sum()
-                  //every half-hour
-                  .multiply(0.5)
-                  .rename('totprec');
-      return totprec
-          .set('doy', curdoy)
-          .set('year', curyear)
-          .set('system:time_start', curdate);
+                  .sum();
+    
+    // Check if the image has data before multiplying
+    var hasData = totprec.bandNames().length().gt(0);
+    
+    var result = ee.Image(ee.Algorithms.If(
+      hasData,
+      totprec.multiply(0.5).rename('totprec'),
+      ee.Image.constant(0).rename('totprec')
+    ));
+  
+    return result
+      .set('doy', curdoy)
+      .set('year', curyear)
+      .set('system:time_start', curdate)
+      .set('has_data', hasData);
   }
+  
+  
   // Map function over list of dates
   var dailyPrecipExtended = ee.ImageCollection.fromImages(precipDates.map(calcDailyPrecip));
   //print('daily precip ext', dailyPrecipExtended);
@@ -205,18 +246,57 @@ function calculateEnvVars(userStartDate, userEndDate){
   // Filter precip data for zonal summaries
   var precipSummary = dailyPrecip.filterDate(reqStartDate, reqEndDate.advance(1, 'day'));
   // Function to calculate zonal statistics for precipitation by woreda
+  // function sumZonalPrecip(image) { 
+  //   // To get the doy and year, we convert the metadata to grids and then summarize
+  //   var image2 = image.addBands([image.metadata('doy').int(), image.metadata('year').int()]);
+  //   // Reduce by regions to get zonal means for each county
+  //   var output = image2.select(['year', 'doy', 'totprec'], ['year', 'doy', 'totprec'])
+  //                     //.resample('bilinear')
+  //                     .reduceRegions({
+  //                       collection: woreda,
+  //                       reducer: ee.Reducer.mean(),
+  //                       scale: 1000});
+  //   return output;
+  // }
+  
+//   function sumZonalPrecip(image) {
+//     var image2 = image.addBands([image.metadata('doy').int(), image.metadata('year').int()]);
+//     var hasData = image.bandNames().length().gt(0);
+    
+//     return ee.Algorithms.If(hasData,
+//         image2.select(['year', 'doy', 'totprec'], ['year', 'doy', 'totprec'])
+//             .reduceRegions({
+//                 collection: woreda,
+//                 reducer: ee.Reducer.mean(),
+//                 scale: 1000
+//             }),
+//         woreda.map(function(feature) {
+//             return feature.set('year', image.get('year'))
+//                 .set('doy', image.get('doy'))
+//                 .set('totprec', null);
+//         })
+//     );
+// }
+
   function sumZonalPrecip(image) { 
-    // To get the doy and year, we convert the metadata to grids and then summarize
-    var image2 = image.addBands([image.metadata('doy').int(), image.metadata('year').int()]);
-    // Reduce by regions to get zonal means for each county
-    var output = image2.select(['year', 'doy', 'totprec'], ['year', 'doy', 'totprec'])
-                       //.resample('bilinear')
-                       .reduceRegions({
-                         collection: woreda,
-                         reducer: ee.Reducer.mean(),
-                         scale: 1000});
+    // To get the doy, year, and has_data, we convert the metadata to grids and then summarize
+    var image2 = image.addBands([
+      image.metadata('doy').int(), 
+      image.metadata('year').int(),
+      image.metadata('has_data').int()  // Add this line
+    ]);
+    
+    // Reduce by regions to get zonal means for each woreda
+    var output = image2.select(['year', 'doy', 'totprec', 'has_data'], ['year', 'doy', 'totprec', 'has_data'])
+                      //.resample('bilinear')
+                      .reduceRegions({
+                        collection: woreda,
+                        reducer: ee.Reducer.mean(),
+                        scale: 1000
+                      });
     return output;
   }
+
   // Map the zonal statistics function over the filtered precip data
   var precipWoreda = precipSummary.map(sumZonalPrecip);         
   // Flatten the results for export
@@ -295,20 +375,20 @@ function calculateEnvVars(userStartDate, userEndDate){
       var basedate = ee.Date.fromYMD(curyear, 1, 1);
       var moddate = basedate.advance(moddoy.subtract(1), 'day');
       var lst_day = lstVars
-                       .select('lst_day')
-                       .filterDate(moddate, moddate.advance(1, 'day'))
-                       .first()
-                       .rename('lst_day');    
+                      .select('lst_day')
+                      .filterDate(moddate, moddate.advance(1, 'day'))
+                      .first()
+                      .rename('lst_day');    
       var lst_night = lstVars
-                       .select('lst_night')
-                       .filterDate(moddate, moddate.advance(1, 'day'))
-                       .first()
-                       .rename('lst_night');   
+                      .select('lst_night')
+                      .filterDate(moddate, moddate.advance(1, 'day'))
+                      .first()
+                      .rename('lst_night');   
       var lst_mean = lstVars
-                       .select('lst_mean')
-                       .filterDate(moddate, moddate.advance(1, 'day'))
-                       .first()
-                       .rename('lst_mean');   
+                      .select('lst_mean')
+                      .filterDate(moddate, moddate.advance(1, 'day'))
+                      .first()
+                      .rename('lst_mean');   
       return lst_day
           .addBands(lst_night)
           .addBands(lst_mean)
@@ -316,6 +396,41 @@ function calculateEnvVars(userStartDate, userEndDate){
           .set('year', curyear)
           .set('system:time_start', curdate);
   }
+  
+//   function calcDailyLst(curdate) {
+//     var curyear = ee.Date(curdate).get('year');
+//     var curdoy = ee.Date(curdate).getRelative('day', 'year').add(1);
+//     var moddoy = curdoy.divide(8).ceil().subtract(1).multiply(8).add(1);
+//     var basedate = ee.Date.fromYMD(curyear, 1, 1);
+//     var moddate = basedate.advance(moddoy.subtract(1), 'day');
+    
+//     var lst_day = lstVars.select('lst_day')
+//                     .filterDate(moddate, moddate.advance(1, 'day'))
+//                     .first();
+//     var lst_night = lstVars.select('lst_night')
+//                     .filterDate(moddate, moddate.advance(1, 'day'))
+//                     .first();
+//     var lst_mean = lstVars.select('lst_mean')
+//                     .filterDate(moddate, moddate.advance(1, 'day'))
+//                     .first();
+    
+//     // Check if any of the LST bands have data
+//     var hasData = ee.Algorithms.Or(
+//         lst_day.bandNames().length().gt(0),
+//         lst_night.bandNames().length().gt(0),
+//         lst_mean.bandNames().length().gt(0)
+//     );
+    
+//     return ee.Algorithms.If(hasData,
+//         ee.Image.cat([lst_day, lst_night, lst_mean])
+//             .set('doy', curdoy)
+//             .set('year', curyear)
+//             .set('system:time_start', curdate),
+//         ee.Image().set('doy', curdoy)
+//             .set('year', curyear)
+//             .set('system:time_start', curdate)
+//     );
+// }
   // Map the function over the image collection
   var dailyLstExtended = ee.ImageCollection.fromImages(lstDates.map(calcDailyLst));
   //print('daily LST extended', dailyLstExtended);
@@ -335,12 +450,34 @@ function calculateEnvVars(userStartDate, userEndDate){
     var image2 = image.addBands([image.metadata('doy').int(), image.metadata('year').int()]);
     // Reduce by regions to get zonal means for each county
     var output = image2.select(['doy', 'year', 'lst_day', 'lst_night', "lst_mean"], ['doy', 'year', 'lst_day', 'lst_night', 'lst_mean'])
-                       .reduceRegions({
-                         collection: woreda,
-                         reducer: ee.Reducer.mean(),
-                         scale: 1000});
+                      .reduceRegions({
+                        collection: woreda,
+                        reducer: ee.Reducer.mean(),
+                        scale: 1000});
     return output;
   }
+  
+//   function sumZonalLst(image) {
+//     var image2 = image.addBands([image.metadata('doy').int(), image.metadata('year').int()]);
+//     var hasData = image.bandNames().length().gt(0);
+    
+//     return ee.Algorithms.If(hasData,
+//         image2.select(['doy', 'year', 'lst_day', 'lst_night', "lst_mean"], ['doy', 'year', 'lst_day', 'lst_night', 'lst_mean'])
+//             .reduceRegions({
+//                 collection: woreda,
+//                 reducer: ee.Reducer.mean(),
+//                 scale: 1000
+//             }),
+//         woreda.map(function(feature) {
+//             return feature.set('year', image.get('year'))
+//                 .set('doy', image.get('doy'))
+//                 .set('lst_day', null)
+//                 .set('lst_night', null)
+//                 .set('lst_mean', null);
+//         })
+//     );
+// }
+
   // Map the zonal statistics function over the filtered lst data
   var lstWoreda = lstSummary.map(sumZonalLst);  
   // Flatten the results for export
@@ -466,18 +603,35 @@ function calculateEnvVars(userStartDate, userEndDate){
       var brdfTemp = brdfFilteredVars.filterDate(ee.Date(curdate), ee.Date(curdate).advance(1, 'day'));
       var brdfSize = brdfTemp.size();
       var outimg = ee.Image(ee.Algorithms.If(brdfSize.eq(0),
-                                               ee.Image.constant(0).selfMask()
-                                                 .addBands(ee.Image.constant(0).selfMask())
-                                                 .addBands(ee.Image.constant(0).selfMask())
-                                                 .addBands(ee.Image.constant(0).selfMask())
-                                                 .addBands(ee.Image.constant(0).selfMask())
-                                                 .rename(['ndvi', 'evi', 'savi', 'ndwi5', 'ndwi6'])
-                                                 .set('doy', curdoy)
-                                                 .set('year', curyear)
-                                                 .set('system:time_start', curdate),
-                                               brdfTemp.first()));
+                                              ee.Image.constant(0).selfMask()
+                                                .addBands(ee.Image.constant(0).selfMask())
+                                                .addBands(ee.Image.constant(0).selfMask())
+                                                .addBands(ee.Image.constant(0).selfMask())
+                                                .addBands(ee.Image.constant(0).selfMask())
+                                                .rename(['ndvi', 'evi', 'savi', 'ndwi5', 'ndwi6'])
+                                                .set('doy', curdoy)
+                                                .set('year', curyear)
+                                                .set('system:time_start', curdate),
+                                              brdfTemp.first()));
       return outimg;
   }
+  
+  // function calcDailyBrdf(curdate) {
+  //   var curyear = ee.Date(curdate).get('year');
+  //   var curdoy = ee.Date(curdate).getRelative('day', 'year').add(1);
+  //   var brdfTemp = brdfFilteredVars.filterDate(ee.Date(curdate), ee.Date(curdate).advance(1, 'day'));
+  //   var brdfSize = brdfTemp.size();
+    
+  //   var outimg = ee.Algorithms.If(brdfSize.gt(0),
+  //       brdfTemp.first(),
+  //       ee.Image().set('doy', curdoy)
+  //           .set('year', curyear)
+  //           .set('system:time_start', curdate)
+  //   );
+    
+  //   return outimg;
+  // }
+  
   // Map the function over the image collection
   var dailyBrdfExtended = ee.ImageCollection.fromImages(brdfDates.map(calcDailyBrdf));
   //print('daily brdf extended ', dailyBrdfExtended);
@@ -493,16 +647,39 @@ function calculateEnvVars(userStartDate, userEndDate){
   // Filter spectral indices for zonal summaries
   var brdfSummary = dailyBrdf.filterDate(reqStartDate, reqEndDate.advance(1, 'day'));
   // Function to calculate zonal statistics for spectral indices by county
-  function sumZonalBrdf(image) { 
-    // To get the doy and year, we convert the metadata to grids and then summarize
+  // function sumZonalBrdf(image) { 
+  //   // To get the doy and year, we convert the metadata to grids and then summarize
+  //   var image2 = image.addBands([image.metadata('doy').int(), image.metadata('year').int()]);
+  //   // Reduce by regions to get zonal means for each county
+  //   var output = image2.select(['doy', 'year', 'ndvi', 'savi', 'evi', 'ndwi5', 'ndwi6'], ['doy', 'year', 'ndvi', 'savi', 'evi', 'ndwi5', 'ndwi6'])
+  //                     .reduceRegions({
+  //                       collection: woreda,
+  //                       reducer: ee.Reducer.mean(),
+  //                       scale: 1000});
+  //   return output;
+  // }
+  
+  function sumZonalBrdf(image) {
     var image2 = image.addBands([image.metadata('doy').int(), image.metadata('year').int()]);
-    // Reduce by regions to get zonal means for each county
-    var output = image2.select(['doy', 'year', 'ndvi', 'savi', 'evi', 'ndwi5', 'ndwi6'], ['doy', 'year', 'ndvi', 'savi', 'evi', 'ndwi5', 'ndwi6'])
-                       .reduceRegions({
-                         collection: woreda,
-                         reducer: ee.Reducer.mean(),
-                         scale: 1000});
-    return output;
+    var hasData = image.bandNames().length().gt(0);
+    
+    return ee.Algorithms.If(hasData,
+        image2.select(['doy', 'year', 'ndvi', 'savi', 'evi', 'ndwi5', 'ndwi6'], ['doy', 'year', 'ndvi', 'savi', 'evi', 'ndwi5', 'ndwi6'])
+            .reduceRegions({
+                collection: woreda,
+                reducer: ee.Reducer.mean(),
+                scale: 1000
+            }),
+        woreda.map(function(feature) {
+            return feature.set('year', image.get('year'))
+                .set('doy', image.get('doy'))
+                .set('ndvi', null)
+                .set('savi', null)
+                .set('evi', null)
+                .set('ndwi5', null)
+                .set('ndwi6', null);
+        })
+    );
   }
   // Map the zonal statistics function over the filtered spectral index data
   var brdfWoreda = brdfSummary.map(sumZonalBrdf);  
@@ -565,7 +742,7 @@ function exportToDrive(){
   Export.table.toDrive({
     collection: precipFlat,
     description: precipFilename,
-    selectors: ['wid', 'woreda', 'doy', 'year', 'totprec']
+    selectors: ['wid', 'woreda', 'doy', 'year', 'totprec', 'has_data']
   });
   Export.table.toDrive({
     collection: lstFlat, 
@@ -932,4 +1109,3 @@ function init() {
 }
 
 init(); 
-
